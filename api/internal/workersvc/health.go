@@ -2179,7 +2179,7 @@ func ownerHoldReason(until time.Time, workerName string) string {
 // protocol capabilities lack it. ClaimRun refuses such a worker on capability regardless of its
 // drain state, so no status or heartbeat precondition applies. A read error is not a gap.
 func (s *Service) assignedRepoAgentSourceGap(ctx context.Context, r store.ListActiveRunsForHealthRow) (string, bool) {
-	if (!r.RepoAgentSourceRequired && !r.RepoAgentSourceCommit.Valid) || !r.WorkerID.Valid {
+	if !(r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid) || !r.WorkerID.Valid {
 		return "", false
 	}
 	w, err := s.q.GetWorkerByIDForUser(ctx, store.GetWorkerByIDForUserParams{ID: uuid.UUID(r.WorkerID.Bytes), UserID: r.UserID})
