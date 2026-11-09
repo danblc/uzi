@@ -14,12 +14,12 @@ Loaded when you touch either Go module. The repo-wide map is the root `CLAUDE.md
 ## api commands (chi + pgx + sqlc + goose)
 
 ```sh
-task gate:api                              # full local gate: check:api + test — NOT the live-DB tests
-task check:api                             # in-run boundary (AGENTS.md Run economy): gate:api minus test:api
+task gate:api                              # full local gate: check:api + deadcode + test — NOT the live-DB tests
+task check:api                             # in-run boundary (AGENTS.md Run economy): gate:api minus deadcode and test:api
 task fmt-check:api                         # format slot alone (gofmt -l, names the drifted files)
 task lint:api                              # lint slot alone — RATCHETED, see .golangci.yml
 task lint:api:all                          # UNFILTERED backlog; reported, never gating, not in `task gate`
-task deadcode:api                          # dead-code slot alone — gated at ZERO against an EMPTY baseline
+task deadcode:api                          # dead-code slot alone — gated at ZERO against an EMPTY baseline; CI runs it nightly only
 task deadcode:api:all                      # WITHOUT -test; reported, never gating, ALWAYS EXITS 0
 task test:api                              # test slot alone (-race -count=1)
 task build:api                             # or vet:api, individually
@@ -58,7 +58,7 @@ cd api && ../scripts/sqlc.sh v1.31.1 generate
 
 ## DTO changes
 
-- A DTO field change is a three-file edit: the Go struct, `fixtures/api-contract/<dto>.{zero,full}.json`, and `web/src/lib/apiTypes.ts`. Whichever you forget, the affected contract tests or exact-head PR CI (full `gate:api` / `gate:web` locally) name it.
+- A DTO field change is a three-file edit: the Go struct, `fixtures/api-contract/<dto>.{zero,full}.json`, and `web/src/lib/apiTypes.ts`. Whichever you forget, the affected contract tests, exact-head PR CI, or the full local `gate:api` / `gate:web` name it.
 - Never hand-author the fixture; re-record it from the exact JSON the failing Go test prints on mismatch (recorded, not authored, no `-update` flag, as `fixtures/run-usage`).
 - The Go contract tests (`api/internal/apitypes/contract_test.go`, `api/internal/handler/contract_test.go`) byte-check the marshal against the fixture and round-trip it through `DisallowUnknownFields`. They know nothing of `apiTypes.ts`.
 
