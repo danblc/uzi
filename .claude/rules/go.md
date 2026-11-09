@@ -19,7 +19,7 @@ task check:api                             # in-run boundary (AGENTS.md Run econ
 task fmt-check:api                         # format slot alone (gofmt -l, names the drifted files)
 task lint:api                              # lint slot alone — RATCHETED, see .golangci.yml
 task lint:api:all                          # UNFILTERED backlog; reported, never gating, not in `task gate`
-task deadcode:api                          # dead-code slot alone — gated at ZERO against an EMPTY baseline; CI runs it nightly only
+task deadcode:api                          # dead-code slot alone — gated at ZERO against an EMPTY baseline; CI runs it on the nightly schedule or manual dispatch
 task deadcode:api:all                      # WITHOUT -test; reported, never gating, ALWAYS EXITS 0
 task test:api                              # test slot alone (-race -count=1)
 task build:api                             # or vet:api, individually
