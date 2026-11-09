@@ -507,12 +507,25 @@ tasks:
     desc: api - fmt-check, vet, build, lint, deadcode, test
     cmds:
       - task: check:api
+      # deadcode AFTER check:api's lint, and the ordering has a CALIBRATION consequence that
+      # is not obvious from the cost (PRD #103 M4). golangci-lint's `unused`
+      # reports unused UNEXPORTED symbols; deadcode reports unreachable functions
+      # whether exported or not. So an unexported dead function reddens `lint:api`
+      # first and THIS TARGET NEVER RUNS - anyone calibrating the dead-code slot
+      # with one demonstrates M3's linter while believing they demonstrated M4's.
+      # Measured 2026-08-02: on a two-function scratch module, `unused` reports
+      # only the unexported one and deadcode reports both. Calibrate with an
+      # EXPORTED symbol. (After build, for the same reason lint is: deadcode
+      # loads and type-checks packages, and on a tree that does not compile it
+      # exits 1 with a load error rather than a build error.)
+      - task: deadcode:api
       - task: test:api
 
   # The in-run API boundary on this repo (AGENTS.md "Run economy"): everything in
-  # gate:api except the full test:api, which exact-head PR CI runs.
+  # gate:api except the full test:api, which exact-head PR CI runs, and deadcode:api,
+  # which CI runs nightly only (#4109; ~16 GB RSS and tens of minutes).
   check:api:
-    desc: api - fmt-check, vet, build, sqlc-drift, lint, deadcode
+    desc: api - fmt-check, vet, build, sqlc-drift, lint
     cmds:
       # fmt-check FIRST, deliberately. Measured 2026-08-02, go1.26.5 darwin/arm64,
       # warm build cache: `task fmt-check:api` 0.11-0.13s over three runs against
@@ -537,18 +550,6 @@ tasks:
       # for the same defect. BEFORE test because it is seconds against test:api's
       # -race run.
       - task: lint:api
-      # deadcode AFTER lint, and the ordering has a CALIBRATION consequence that
-      # is not obvious from the cost (PRD #103 M4). golangci-lint's `unused`
-      # reports unused UNEXPORTED symbols; deadcode reports unreachable functions
-      # whether exported or not. So an unexported dead function reddens `lint:api`
-      # first and THIS TARGET NEVER RUNS - anyone calibrating the dead-code slot
-      # with one demonstrates M3's linter while believing they demonstrated M4's.
-      # Measured 2026-08-02: on a two-function scratch module, `unused` reports
-      # only the unexported one and deadcode reports both. Calibrate with an
-      # EXPORTED symbol. (After build, for the same reason lint is: deadcode
-      # loads and type-checks packages, and on a tree that does not compile it
-      # exits 1 with a load error rather than a build error.)
-      - task: deadcode:api
 
   gate:controller:
     desc: controller - fmt-check, vet, build, lint, deadcode, test
