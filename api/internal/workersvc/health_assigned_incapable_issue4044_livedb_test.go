@@ -270,6 +270,14 @@ func TestIssue4044HealthVariantsLiveDB(t *testing.T) {
 			t.Fatalf("reason = %q, want %q", got, want)
 		}
 	})
+	t.Run("no online worker still wins", func(t *testing.T) {
+		f := newIssue4044(t, issue4044Opts{required: true, commit: true})
+		f.e.exec(t, `UPDATE workers SET status = 'offline', last_heartbeat_at = now() - interval '1 day' WHERE id = $1`, f.old)
+		if got := f.reason(t); got != reasonNoWorker {
+			t.Fatalf("reason = %q, want %q", got, reasonNoWorker)
+		}
+		f.commitIntact(t)
+	})
 	t.Run("a manual cordon on the only capable peer still wins", func(t *testing.T) {
 		f := newIssue4044(t, issue4044Opts{required: true, commit: true})
 		peer := f.addPeer(t, "peer-cordon-4044", "online", []string{issue4044RepoCap}, 2, 0)
