@@ -219,6 +219,13 @@ const (
 	reasonNoCIConfigGuardCapableWorker      = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	reasonNoRepoAgentSourceCapableWorker    = "no online worker reads repo agents at a recorded default-branch revision (repo_agent_source_v1); upgrade a worker"
 	reasonNoAgentSourceRequestCapableWorker = "no online worker honours the run's requested agent source (agent_source_request_v1); upgrade a worker"
+	// Issue #4044: the run's assigned worker lacks repo_agent_source_v1, so ClaimRun refuses it on
+	// capability even where the own-worker drain allowance would otherwise let it resume. The
+	// suffixes say whether a capable peer is full or merely has not claimed yet.
+	reasonAssignedLacksRepoAgentSource      = "does not report repo_agent_source_v1, which this run requires, so it cannot resume this run"
+	reasonAssignedGapCapablePeersFullSuffix = "; a worker that reports it is online but has no free slot"
+	reasonAssignedGapCapablePeerFreeSuffix  = "; waiting for a worker that reports it to pick up this run"
+	reasonAssignedGapOwnerHoldSuffix        = "cannot resume this run; another worker may take it after that"
 	// reasonNoRepoAgentSourceAndRequestCapableWorker (issue #4005) is emitted when each of the two
 	// reasons above is satisfied by some worker but no single worker satisfies both.
 	reasonNoRepoAgentSourceAndRequestCapableWorker = "no single online worker supports both repo agent sources (repo_agent_source_v1) and the requested agent source (agent_source_request_v1); upgrade a worker"
@@ -1385,13 +1392,13 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	if eligibilityErr == nil {
 		if reason := manualCordonWaitReason(eligibility); reason != "" {
 			if held && eligibility.AutomaticOwnerHold {
-				reason += "; " + ownerHoldReason(until, r.StaleRequeueWorkerName)
+				reason += "; " + s.ownerHoldReasonFor(ctx, r, until)
 			}
 			return reason
 		}
 	}
 	if held && !preserveManual && (eligibilityErr != nil || (eligibility.AssignedClaimable == 0 && (eligibility.ManualCordoned == 0 || eligibility.AutomaticOwnerHold))) {
-		return ownerHoldReason(until, r.StaleRequeueWorkerName)
+		return s.ownerHoldReasonFor(ctx, r, until)
 	}
 	if until, pinned := s.staleRequeuePin(now, r); pinned {
 		return staleRequeuePinReason(until, r.StaleRequeueWorkerName)
@@ -1788,6 +1795,22 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			}
 		}
 	}
+	if name, gap := s.assignedRepoAgentSourceGap(ctx, r); gap {
+		if q, ok := s.q.(interface {
+			CountOnlineWorkersRepoAgentSourceCapacity(context.Context, uuid.UUID) (store.CountOnlineWorkersRepoAgentSourceCapacityRow, error)
+		}); ok {
+			capacity, cerr := q.CountOnlineWorkersRepoAgentSourceCapacity(ctx, r.UserID)
+			if cerr != nil {
+				slog.Error("health: count repo agent source capacity", "run_id", r.ID, "error", cerr)
+			} else if capacity.Capable > 0 {
+				prefix := "assigned worker " + name + " " + reasonAssignedLacksRepoAgentSource
+				if capacity.CapableFree == 0 {
+					return prefix + reasonAssignedGapCapablePeersFullSuffix
+				}
+				return prefix + reasonAssignedGapCapablePeerFreeSuffix
+			}
+		}
+	}
 	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, r.UserID)
 	if err != nil {
 		slog.Error("health: count online workers with free slot", "error", err)
@@ -2151,6 +2174,35 @@ func ownerHoldReason(until time.Time, workerName string) string {
 		" to finish draining or maintenance; another worker may take it after that"
 }
 
+// assignedRepoAgentSourceGap (issue #4044) reports the run's assigned worker name when the run
+// requires repo_agent_source_v1 (required flag or a recorded commit) and that worker's stored
+// protocol capabilities lack it. ClaimRun refuses such a worker on capability regardless of its
+// drain state, so no status or heartbeat precondition applies. A read error is not a gap.
+func (s *Service) assignedRepoAgentSourceGap(ctx context.Context, r store.ListActiveRunsForHealthRow) (string, bool) {
+	if !(r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid) || !r.WorkerID.Valid {
+		return "", false
+	}
+	w, err := s.q.GetWorkerByIDForUser(ctx, store.GetWorkerByIDForUserParams{ID: uuid.UUID(r.WorkerID.Bytes), UserID: r.UserID})
+	if err != nil {
+		slog.Warn("health: read assigned worker for repo agent source gap", "run_id", r.ID, "error", err)
+		return "", false
+	}
+	if slices.Contains(w.ProtocolCapabilities, capability.RepoAgentSourceV1) {
+		return "", false
+	}
+	return w.Name, true
+}
+
+// ownerHoldReasonFor renders the owner-hold reason, naming the capability gap when the previous
+// worker cannot resume the run (issue #4044). A pure function of its inputs plus the worker row.
+func (s *Service) ownerHoldReasonFor(ctx context.Context, r store.ListActiveRunsForHealthRow, until time.Time) string {
+	if name, gap := s.assignedRepoAgentSourceGap(ctx, r); gap {
+		return reasonStaleRequeuePinPrefix + until.UTC().Format(time.RFC3339) + " for its previous worker " + name +
+			", which " + reasonAssignedLacksRepoAgentSource + "; another worker may take it after that"
+	}
+	return ownerHoldReason(until, r.StaleRequeueWorkerName)
+}
+
 // staleRequeuePin reports whether ClaimRun is holding this queued run for its returning worker
 // right now (issue #2705) and, if so, the instant the hold ends. It is the Go mirror of the
 // effective pin E the provisioning queries use: the non-time half (stale_requeue_pinnable) comes
@@ -2193,6 +2245,7 @@ func isStaleRequeuePinReason(reason string) bool {
 	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix) &&
 		strings.Contains(reason, " for its previous worker") &&
 		(strings.HasSuffix(reason, " to return; another worker may take it after that") ||
+			strings.HasSuffix(reason, reasonAssignedGapOwnerHoldSuffix) ||
 			strings.HasSuffix(reason, " to finish draining or maintenance; another worker may take it after that"))
 }
 

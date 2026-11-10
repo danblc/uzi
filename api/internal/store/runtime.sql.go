@@ -3079,6 +3079,39 @@ func (q *Queries) CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUI
 	return count, err
 }
 
+const countOnlineWorkersRepoAgentSourceCapacity = `-- name: CountOnlineWorkersRepoAgentSourceCapacity :one
+SELECT
+  count(*) AS capable,
+  count(*) FILTER (WHERE w.max_concurrent_runs IS NULL
+       OR (SELECT count(*) FROM runs r
+            WHERE r.worker_id = w.id
+              AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+              AND r.kind <> 'chat' AND NOT r.cross_check_lane) < w.max_concurrent_runs) AS capable_free
+FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND fn_worker_accepts_new_intake(w)
+  AND NOT w.ephemeral
+  AND NOT w.isolated_lane
+  AND 'repo_agent_source_v1' = ANY(w.protocol_capabilities)
+`
+
+type CountOnlineWorkersRepoAgentSourceCapacityRow struct {
+	Capable     int64 `json:"capable"`
+	CapableFree int64 `json:"capable_free"`
+}
+
+// Issue #4044: a queued continuation whose assigned worker lacks repo_agent_source_v1 is refused
+// by ClaimRun on capability, so the generic busy/free-slot wording would mislead. `capable` has
+// exactly the filters of CountOnlineWorkersSatisfyingRepoAgentSource; `capable_free` additionally
+// applies the free-slot lane definition of CountOnlineWorkersWithFreeSlotForUser.
+func (q *Queries) CountOnlineWorkersRepoAgentSourceCapacity(ctx context.Context, userID uuid.UUID) (CountOnlineWorkersRepoAgentSourceCapacityRow, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersRepoAgentSourceCapacity, userID)
+	var i CountOnlineWorkersRepoAgentSourceCapacityRow
+	err := row.Scan(&i.Capable, &i.CapableFree)
+	return i, err
+}
+
 const countOnlineWorkersSatisfyingAgentSourceRequest = `-- name: CountOnlineWorkersSatisfyingAgentSourceRequest :one
 SELECT count(*) FROM workers w
 WHERE w.user_id = $1
