@@ -151,8 +151,11 @@ func TestCapacityBlockerProjectionFailureDoesNotChangeSeverity(t *testing.T) {
 }
 
 func TestCapacityBlockersComposedBudgetPreservesActions(t *testing.T) {
-	for _, status := range []string{"queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "paused", "pool_wait", "limit_wait", "recovery_wait"} {
+	for _, status := range []string{"queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "paused", "pool_wait", "limit_wait", "recovery_wait", "queued+repo_agent_source"} {
 		t.Run(status, func(t *testing.T) {
+			// Issue #4044: a queued run whose assigned worker lacks repo_agent_source_v1.
+			missingRepoAgentSource := status == "queued+repo_agent_source"
+			status = strings.TrimSuffix(status, "+repo_agent_source")
 			o, w, run := uuid.New(), uuid.New(), uuid.New()
 			long := pgtype.Text{String: strings.Repeat("界", 200) + "\n\u202e", Valid: true}
 			stamp := pgtype.Timestamptz{Time: fixedNow.Add(time.Hour), Valid: true}
@@ -161,7 +164,8 @@ func TestCapacityBlockersComposedBudgetPreservesActions(t *testing.T) {
 				workers:      []store.ListAllWorkersRow{{Worker: store.Worker{ID: w, UserID: o, Kind: "hosted", DrainingSince: stamp}}},
 				blockerRows: []store.ListWorkerUpgradeBlockersRow{{WorkerID: w, WorkerOwner: o, OwnerMismatch: true, SafeCount: 999999,
 					RunID: pgtype.UUID{Bytes: run, Valid: true}, Kind: pgtype.Text{String: "cross_check", Valid: true}, Status: pgtype.Text{String: status, Valid: true},
-					HealthReason: long, HoldReason: long, RecoveryWaitCause: long, LimitResetsAt: stamp, RetryNotBefore: stamp, RecoveryRetryNotBefore: stamp}},
+					HealthReason: long, HoldReason: long, RecoveryWaitCause: long, LimitResetsAt: stamp, RetryNotBefore: stamp, RecoveryRetryNotBefore: stamp,
+					MissingRepoAgentSource: missingRepoAgentSource}},
 			}
 			c := newSvc(f, nil).checkFleetCapacity(context.Background(), fixedNow, healthDetectorEnabled)
 			v := c.Evidence[0].Value
@@ -179,7 +183,10 @@ func TestCapacityBlockersComposedBudgetPreservesActions(t *testing.T) {
 			if status == "limit_wait" && !strings.Contains(v, "no roll time promised") {
 				t.Fatal(v)
 			}
-			if status == "queued" && !strings.Contains(v, "exact fence unavailable, inspect run") {
+			if status == "queued" && !missingRepoAgentSource && !strings.Contains(v, "exact fence unavailable, inspect run") {
+				t.Fatal(v)
+			}
+			if missingRepoAgentSource && (!strings.Contains(v, "repo_agent_source_v1") || strings.Contains(v, "exact fence unavailable")) {
 				t.Fatal(v)
 			}
 			if status == "recovery_wait" && !strings.Contains(v, "automatic retry not before") {

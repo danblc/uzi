@@ -6,9 +6,11 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -227,5 +229,102 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 	t.Logf("workers: %d fixture; terminal history: 8000, 90%% skew; fresh ANALYZE; authorized batch: 4\n%s", 10+5+63, strings.Join(lines, "\n"))
 	if len(lines) == 0 {
 		t.Fatal("EXPLAIN returned no plan")
+	}
+}
+
+// Issue #4044: a queued run assigned to a worker without repo_agent_source_v1 is flagged, so the
+// upgrade blocker names the capability; a capable worker and a non-queued run are not flagged. The
+// hosted controller's Busy projection keeps counting the run as a blocker regardless.
+func TestWorkerUpgradeBlockersMissingRepoAgentSourceLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := tx.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	owner, conn, repo := uuid.New(), uuid.New(), uuid.New()
+	exec("INSERT INTO users (id,email,password_hash) VALUES ($1,$2,'x')", owner, owner.String()+"@blockers4044.test")
+	exec("INSERT INTO forge_connections (id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext) VALUES ($1,$2,'gitlab','https://forge.test','bot',1,$3)", conn, owner, []byte{1})
+	exec("INSERT INTO repos (id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch) VALUES ($1,$2,1,'g/r4044','https://forge.test/g/r4044','main')", repo, conn)
+	worker := func(caps []string) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		exec("INSERT INTO workers (id,user_id,name,token_hash,status,protocol_capabilities) VALUES ($1,$2,'blocker-4044',$3,'online',$4)", id, owner, id[:], caps)
+		return id
+	}
+	iid := int64(0)
+	run := func(w uuid.UUID, status string, required bool, commit any) uuid.UUID {
+		t.Helper()
+		iid++
+		id := uuid.New()
+		exec(`INSERT INTO runs (id,user_id,repo_id,issue_iid,worker_id,status,kind,issue_title,issue_description,repo_agent_source_required,repo_agent_source_commit)
+			VALUES ($1,$2,$3,$4,$5,$6,'issue','t','d',$7,$8)`, id, owner, repo, iid, w, status, required, commit)
+		return id
+	}
+	commit := "0123456789abcdef0123456789abcdef01234567"
+	incapable, capable, claimed, plain := worker([]string{}), worker([]string{"repo_agent_source_v1"}), worker([]string{}), worker([]string{})
+	incapableRun := run(incapable, "queued", true, nil) // #4047 shape: required, no commit yet
+	committedRun := run(plain, "queued", false, commit) // commit-only shape on an incapable worker
+	capableRun := run(capable, "queued", true, commit)
+	claimedRun := run(claimed, "claimed", true, commit)
+	want := map[uuid.UUID]bool{incapableRun: true, committedRun: true, capableRun: false, claimedRun: false}
+	rows, err := store.New(tx).ListWorkerUpgradeBlockers(ctx, []uuid.UUID{incapable, capable, claimed, plain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := 0
+	for _, r := range rows {
+		id := uuid.UUID(r.RunID.Bytes)
+		w, ok := want[id]
+		if !ok {
+			t.Fatalf("unexpected row %+v", r)
+		}
+		if r.MissingRepoAgentSource != w {
+			t.Fatalf("run %s status %s: MissingRepoAgentSource = %v, want %v", id, r.Status.String, r.MissingRepoAgentSource, w)
+		}
+		seen++
+	}
+	if seen != len(want) {
+		t.Fatalf("saw %d of %d runs: %+v", seen, len(want), rows)
+	}
+
+	// Hosted Busy projection: the incapable worker still counts as busy (assignment, not capability).
+	exec("UPDATE workers SET kind='hosted', hosted_size='small', template_declared='default' WHERE id=$1", incapable)
+	hosted, err := store.New(tx).ListHostedWorkersForController(ctx, store.ListHostedWorkersForControllerParams{
+		DiskPressureMinStreak: 2,
+		HeartbeatCutoff:       pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, h := range hosted {
+		if h.ID == incapable {
+			found = true
+			if !h.Busy {
+				t.Fatalf("hosted Busy = false for a worker holding a queued continuation it cannot claim")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("hosted worker %s missing from controller projection (%d rows)", incapable, len(hosted))
 	}
 }

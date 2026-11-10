@@ -181,3 +181,20 @@ func TestAdoptionFailureBlockerRequiresOwnerRegardlessOfStamp(t *testing.T) {
 		}
 	}
 }
+
+// Issue #4044: a queued run assigned to a worker lacking repo_agent_source_v1 says so, and the
+// codex admission masking still applies to the recorded reason.
+func TestUpgradeBlockerQueuedMissingRepoAgentSource(t *testing.T) {
+	row := store.ListWorkerUpgradeBlockersRow{
+		Status: blockerText("queued"), MissingRepoAgentSource: true,
+		HealthReason: blockerText("vault_locked"), HoldReason: blockerText("credential_disabled"),
+	}
+	want := "own continuation needs repo_agent_source_v1, which this worker lacks; recorded reason vault_locked; hold credential_disabled"
+	if got := blockerAction(row); got != want {
+		t.Fatalf("action = %q, want %q", got, want)
+	}
+	row.MissingRepoAgentSource = false
+	if got := blockerAction(row); !strings.Contains(got, "exact fence unavailable, inspect run") || strings.Contains(got, "repo_agent_source_v1") {
+		t.Fatalf("ordinary queued action changed: %q", got)
+	}
+}

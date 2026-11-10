@@ -141,6 +141,11 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 		if r.HealthReason.Valid && apitypes.IsCodexAdmissionReason(r.HealthReason.String) {
 			r.HealthReason.String = "waiting: admission held"
 		}
+		// Issue #4044: ClaimRun refuses this worker for its own continuation, so a capable
+		// worker must claim it; waiting on this worker does not help.
+		if r.MissingRepoAgentSource {
+			return fmt.Sprintf("own continuation needs repo_agent_source_v1, which this worker lacks; recorded reason %s; hold %s", blockerFact(r.HealthReason), blockerFact(r.HoldReason))
+		}
 		return fmt.Sprintf("own continuation must become claimable; recorded reason %s; hold %s; exact fence unavailable, inspect run", blockerFact(r.HealthReason), blockerFact(r.HoldReason))
 	default:
 		return "releasing action unavailable; inspect run"
