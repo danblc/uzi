@@ -128,6 +128,61 @@ func TestWorkerUpgradeBlockersProjectionLiveDB(t *testing.T) {
 			t.Fatalf("%+v", r)
 		}
 	}
+	// missing_repo_agent_source: only queued runs that require (or pin) the repo agent
+	// source on a worker lacking repo_agent_source_v1.
+	capable := worker()
+	exec("UPDATE workers SET protocol_capabilities = ARRAY['repo_agent_source_v1'] WHERE id=$1", capable)
+	pin := strings.Repeat("a", 40)
+	type gapCase struct {
+		name         string
+		worker       uuid.UUID
+		status       string
+		required     bool
+		commit       any
+		wantMissing  bool
+		wantSafeRows int64
+	}
+	var gaps []gapCase
+	for _, c := range []gapCase{
+		{name: "required incapable", worker: worker(), status: "queued", required: true, wantMissing: true},
+		{name: "commit incapable", worker: worker(), status: "queued", commit: pin, wantMissing: true},
+		{name: "required capable", worker: capable, status: "queued", required: true},
+		{name: "running required incapable", worker: worker(), status: "running", required: true},
+		{name: "queued not requiring", worker: worker(), status: "queued"},
+	} {
+		c.wantSafeRows = 1
+		id := uuid.New()
+		seed(id, owner, c.worker, c.status, "chat")
+		exec("UPDATE runs SET repo_agent_source_required=$2, repo_agent_source_commit=$3 WHERE id=$1", id, c.required, c.commit)
+		gaps = append(gaps, c)
+	}
+	var gapIDs []uuid.UUID
+	for _, c := range gaps {
+		gapIDs = append(gapIDs, c.worker)
+	}
+	rows, err = q.ListWorkerUpgradeBlockers(ctx, gapIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != len(gaps) {
+		t.Fatalf("gap rows: %+v", rows)
+	}
+	for _, c := range gaps {
+		found := false
+		for _, r := range rows {
+			if r.WorkerID != c.worker {
+				continue
+			}
+			found = true
+			if r.MissingRepoAgentSource != c.wantMissing || r.SafeCount != c.wantSafeRows || r.OwnerMismatch {
+				t.Fatalf("%s: missing=%v safe=%d mismatch=%v", c.name, r.MissingRepoAgentSource, r.SafeCount, r.OwnerMismatch)
+			}
+		}
+		if !found {
+			t.Fatalf("%s: no row", c.name)
+		}
+	}
+
 	// Top five must use UUID order and the entire safe population's count.
 	top, empty, mixed, foreignOnly, other := worker(), worker(), worker(), worker(), worker()
 	var runIDs []string

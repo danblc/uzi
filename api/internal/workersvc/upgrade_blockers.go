@@ -141,6 +141,9 @@ func blockerAction(r store.ListWorkerUpgradeBlockersRow) string {
 		if r.HealthReason.Valid && apitypes.IsCodexAdmissionReason(r.HealthReason.String) {
 			r.HealthReason.String = "waiting: admission held"
 		}
+		if r.MissingRepoAgentSource {
+			return fmt.Sprintf("worker "+repoAgentSourceGapFragment+"; a capable worker must claim it or this worker re-registers with it; recorded reason %s", blockerFact(r.HealthReason))
+		}
 		return fmt.Sprintf("own continuation must become claimable; recorded reason %s; hold %s; exact fence unavailable, inspect run", blockerFact(r.HealthReason), blockerFact(r.HoldReason))
 	default:
 		return "releasing action unavailable; inspect run"
