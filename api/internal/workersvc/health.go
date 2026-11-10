@@ -144,6 +144,10 @@ const (
 	// TestStaleRequeuePinPrefixMatchesListWaitingWorkerRunsSQL). The fixed previous-worker
 	// segment and terminal suffixes distinguish both holds from the code cross-check wait.
 	reasonStaleRequeuePinPrefix = "waiting until "
+	// reasonOwnerHoldIncapableSuffix (#4044) ends the owner-hold reason for a run whose
+	// previous worker lacks repo_agent_source_v1, so that worker can never resume it. The hold
+	// still ends at the affinity ceiling; the text says why waiting on the owner is pointless.
+	reasonOwnerHoldIncapableSuffix = ", which lacks repo_agent_source_v1 that this run requires and cannot resume it; a capable worker may take it after that"
 	// reasonAllWorkersBusy (PRD #216) distinguishes a saturated fleet from an idle
 	// queue: every online worker is at its advertised run-lane cap, so this run is
 	// waiting for a SLOT to free — not for a worker to come online — and the
@@ -1391,6 +1395,9 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 		}
 	}
 	if held && !preserveManual && (eligibilityErr != nil || (eligibility.AssignedClaimable == 0 && (eligibility.ManualCordoned == 0 || eligibility.AutomaticOwnerHold))) {
+		if name, lacks := s.assignedWorkerLacksRepoAgentSource(ctx, r); lacks {
+			return ownerHoldIncapableReason(until, name)
+		}
 		return ownerHoldReason(until, r.StaleRequeueWorkerName)
 	}
 	if until, pinned := s.staleRequeuePin(now, r); pinned {
@@ -1788,6 +1795,11 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			}
 		}
 	}
+	// Issue #4044: the assigned worker is online but lacks repo_agent_source_v1, so it cannot
+	// resume its own run even while draining; the busy/waiting text would blame the wrong thing.
+	if name, lacks := s.assignedWorkerLacksRepoAgentSource(ctx, r); lacks {
+		return assignedIncapableTailReason(name, eligibility, eligibilityErr)
+	}
 	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, r.UserID)
 	if err != nil {
 		slog.Error("health: count online workers with free slot", "error", err)
@@ -2142,6 +2154,59 @@ func (s *Service) ownerHold(now time.Time, r store.ListActiveRunsForHealthRow) (
 	return until, !now.After(until)
 }
 
+// ownerHoldIncapableReason (#4044) renders the owner hold for a run whose assigned worker is
+// online but lacks repo_agent_source_v1: ClaimRun refuses that worker for the run, so the
+// hold is not "waiting to finish draining" but waiting out the ceiling for a capable peer.
+func ownerHoldIncapableReason(until time.Time, workerName string) string {
+	who := "its previous worker"
+	if workerName != "" {
+		who += " " + workerName
+	}
+	return reasonStaleRequeuePinPrefix + until.UTC().Format(time.RFC3339) + " for " + who + reasonOwnerHoldIncapableSuffix
+}
+
+// assignedWorkerLacksRepoAgentSource (#4044) reports whether the run needs repo agent source
+// (required flag or a recorded commit), is assigned to a worker of its owner that is online,
+// and that worker does not advertise repo_agent_source_v1. ClaimRun's standalone repo-agent-source
+// clause refuses such a worker and its drain allowance cannot override the clause, so the
+// run can only be taken by a capable peer. It returns the worker name. A failed read returns
+// false so the ordinary reasons stand.
+func (s *Service) assignedWorkerLacksRepoAgentSource(ctx context.Context, r store.ListActiveRunsForHealthRow) (string, bool) {
+	if !(r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid) || !r.WorkerID.Valid {
+		return "", false
+	}
+	id := uuid.UUID(r.WorkerID.Bytes)
+	w, err := s.q.GetWorkerByID(ctx, id)
+	if err != nil {
+		slog.Error("health: read assigned worker for repo agent source", "run_id", r.ID, "worker_id", id, "error", err)
+		return "", false
+	}
+	if w.ID != id || w.UserID != r.UserID || w.Status != "online" ||
+		slices.Contains(w.ProtocolCapabilities, capability.RepoAgentSourceV1) {
+		return "", false
+	}
+	return w.Name, true
+}
+
+// assignedIncapableTailReason (#4044) is the generic-tail reason for a run whose assigned
+// worker lacks repo_agent_source_v1. It names the previous worker and the real obstacle
+// instead of the fleet-wide busy text.
+func assignedIncapableTailReason(workerName string, eligibility store.CountOnlineWorkersClaimableForRunRow, eligibilityErr error) string {
+	who := "its previous worker"
+	if workerName != "" {
+		who += " " + workerName
+	}
+	prefix := who + " lacks repo_agent_source_v1, which this run requires, so it cannot resume it; "
+	switch {
+	case eligibilityErr == nil && eligibility.NonDrainingClaimable > 0:
+		return prefix + "waiting for a capable worker to claim it"
+	case eligibilityErr == nil && eligibility.NonDrainingEligible > 0:
+		return prefix + "the capable workers that may take it are busy; waiting for a free slot on one"
+	default:
+		return prefix + "no other worker can take it yet"
+	}
+}
+
 func ownerHoldReason(until time.Time, workerName string) string {
 	who := "its previous worker"
 	if workerName != "" {
@@ -2193,6 +2258,7 @@ func isStaleRequeuePinReason(reason string) bool {
 	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix) &&
 		strings.Contains(reason, " for its previous worker") &&
 		(strings.HasSuffix(reason, " to return; another worker may take it after that") ||
+			strings.HasSuffix(reason, reasonOwnerHoldIncapableSuffix) ||
 			strings.HasSuffix(reason, " to finish draining or maintenance; another worker may take it after that"))
 }
 

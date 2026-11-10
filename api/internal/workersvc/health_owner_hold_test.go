@@ -199,3 +199,21 @@ func TestHealthOwnerHoldLifecycle(t *testing.T) {
 		})
 	}
 }
+
+// Issue #4044: the incapable-owner hold is an expected owner hold like the other two, and the
+// code cross-check wait (same prefix) stays outside it.
+func TestIsStaleRequeuePinReasonAcceptsIncapableOwnerHold(t *testing.T) {
+	until := t0
+	for _, name := range []string{"w1", ""} {
+		if got := ownerHoldIncapableReason(until, name); !isStaleRequeuePinReason(got) {
+			t.Errorf("ownerHoldIncapableReason(%q) = %q not recognised as an owner hold", name, got)
+		}
+	}
+	if got := ownerHoldIncapableReason(until, ""); got !=
+		"waiting until 2026-07-12T12:00:00Z for its previous worker, which lacks repo_agent_source_v1 that this run requires and cannot resume it; a capable worker may take it after that" {
+		t.Errorf("empty-name render = %q", got)
+	}
+	if isStaleRequeuePinReason("waiting until 2026-07-12T12:00:00Z for someone, which lacks repo_agent_source_v1 that this run requires and cannot resume it; a capable worker may take it after that") {
+		t.Error("a reason without the previous-worker segment must not match")
+	}
+}
